@@ -7,7 +7,8 @@ This repository targets a Python CLI for fetching Polar AccessLink heart-rate da
 Current state in this repository:
 - CLI scaffold exists at `src/polarlevel/`.
 - `python -m polarlevel fetch ...` is implemented with argument validation and CSV/JSON output.
-- Real Polar API integration is not implemented yet; use `--dry-run` to validate end-to-end CLI flow.
+- Polar AccessLink exercise transaction flow is implemented for non-dry-run mode.
+- OAuth token refresh and token persistence are implemented.
 
 ## Implemented in Scaffold
 
@@ -16,23 +17,20 @@ Current state in this repository:
 - Schema-conformant CSV and JSON export.
 - Standardized exit codes for CLI automation.
 - `--dry-run` mode that writes sample records without API calls.
+- Live API flow: create transaction, list exercises, download exercise details, commit transaction.
+- Retry handling for transient HTTP failures (`429`, `5xx`).
+- Token handling flow: load from store/env, refresh on `401`, persist rotated tokens.
 
 ## Planned Next
 
-- Integrate [Polar Open AccessLink](https://www.polar.com/accesslink-api/) API calls.
-- Implement OAuth token refresh and token persistence.
-- Replace dry-run placeholder records with live fetched records.
-- Add retry logic for transient API failures.
+- Improve sample extraction coverage for additional AccessLink payload variants.
 
 ## Python and Dependency Baseline
 
 Source of truth is `pyproject.toml`:
 - Python version: `>=3.14`
-- Runtime dependencies: currently none declared
+- Runtime dependencies: `requests`
 - Build backend: `pdm-backend`
-
-Notes:
-- Earlier drafts referenced `requests`, `pandas`, and `oauthlib`; these are expected future runtime dependencies once the CLI implementation is added.
 
 ## Installation (Current)
 
@@ -42,7 +40,7 @@ python -c "import polarlevel; print('polarlevel import ok')"
 polarlevel --help
 ```
 
-## CLI Usage (Current Scaffold)
+## CLI Usage
 
 Supported entrypoints:
 - `python -m polarlevel`
@@ -50,30 +48,54 @@ Supported entrypoints:
 
 Examples:
 - Latest available data:
-  `python -m polarlevel fetch --latest --output output.json --dry-run`
+	`python -m polarlevel fetch --latest --output output.json`
 - Date range data:
-  `python -m polarlevel fetch --start-date YYYY-MM-DD --end-date YYYY-MM-DD --output output.csv --dry-run`
+	`python -m polarlevel fetch --start-date YYYY-MM-DD --end-date YYYY-MM-DD --output output.csv`
+- Dry-run serialization check:
+	`python -m polarlevel fetch --latest --output output.json --dry-run`
 
 Argument and time rules:
 - `--start-date` and `--end-date` use `YYYY-MM-DD` (ISO date).
 - Date range is inclusive on both boundaries.
 - Output timestamps are normalized to UTC in ISO-8601 format.
 
-## OAuth2 Configuration (Scaffold Validation)
+## OAuth2 Configuration
 
-Expected environment variables:
+Required environment variables:
 
 ```bash
+export POLAR_USER_ID="..."
 export POLAR_CLIENT_ID="..."
 export POLAR_CLIENT_SECRET="..."
 export POLAR_REDIRECT_URI="http://localhost:8000/callback"
-export POLAR_ACCESS_TOKEN="..."
-export POLAR_REFRESH_TOKEN="..."
 ```
 
-Current scaffold behavior:
-- Non-dry-run mode validates these variables and fails fast if any are missing.
-- Live API calls and token refresh are not implemented yet.
+Token input options:
+
+```bash
+# Option A: direct environment tokens
+export POLAR_ACCESS_TOKEN="..."
+export POLAR_REFRESH_TOKEN="..."
+
+# Option B: token store file containing {"access_token": "...", "refresh_token": "..."}
+export POLAR_TOKEN_STORE_PATH=".secrets/polar_tokens.json"
+```
+
+Optional environment variables:
+
+```bash
+export POLAR_ACCESSLINK_BASE_URL="https://www.polaraccesslink.com"
+export POLAR_OAUTH_TOKEN_URL="https://polarremote.com/v2/oauth2/token"
+export POLAR_ACCESSLINK_TIMEOUT_SECONDS="30"
+export POLAR_ACCESSLINK_RETRY_COUNT="3"
+```
+
+Current behavior:
+- Non-dry-run mode validates required OAuth settings and token source availability.
+- Access token and refresh token are loaded from token store when present, otherwise from environment.
+- Non-dry-run mode performs live API calls using the exercise transaction flow.
+- On HTTP `401`, the CLI refreshes the access token via refresh-token grant and retries the request.
+- Refreshed tokens are persisted to `POLAR_TOKEN_STORE_PATH`.
 - Do not commit credentials or token files.
 
 ## Output Schema Contract
@@ -96,12 +118,14 @@ Serialization rules:
 - JSON uses an array of objects with the same field names.
 - Missing optional numeric fields are serialized as empty values in CSV and `null` in JSON.
 
-## Error Handling Contract (Planned)
+## Error Handling
 
 Behavior:
 - Argument validation errors return non-zero exits.
 - Missing OAuth env configuration returns an authentication error in non-dry-run mode.
-- Non-dry-run fetch currently exits as API failure because live integration is still pending.
+- Token refresh failures return an authentication error.
+- Transient HTTP failures (`429`, `5xx`) are retried with exponential backoff.
+- Invalid AccessLink responses or exhausted retries return API failure.
 - Output write and serialization errors are surfaced as output failures.
 
 CLI exit codes:
@@ -121,16 +145,16 @@ Use this flow to validate local setup now:
 
 1. Install in editable mode:
 	`python -m pip install -e .`
-2. Run a dry-run fetch command:
-	`python -m polarlevel fetch --latest --output output.csv --dry-run`
-3. Inspect output file.
-
-For non-dry-run auth validation only:
-
-1. Export OAuth2 environment variables.
-2. Run:
+2. Export OAuth2 environment variables.
+3. Run a live fetch command:
 	`python -m polarlevel fetch --latest --output output.csv`
-3. Expect an API failure exit until live integration is implemented.
+4. Inspect output columns.
+
+Dry-run mode remains available when you want to validate output serialization without API calls:
+
+1. Run:
+	`python -m polarlevel fetch --latest --output output.csv --dry-run`
+2. Inspect output file.
 
 ## Testing and Validation
 
@@ -138,7 +162,10 @@ Current test coverage includes:
 - CLI argument validation.
 - Dry-run output file generation.
 - Authentication env validation path.
-- API placeholder failure path in non-dry-run mode.
+- API failure path handling in non-dry-run mode.
+- Mocked AccessLink transaction flow and date-range filtering.
+- OAuth config loading and token-store fallback.
+- OAuth token refresh and persistence.
 
 Run tests:
 

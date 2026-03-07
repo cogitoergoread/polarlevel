@@ -5,7 +5,9 @@ from pathlib import Path
 
 import pytest
 
+from polarlevel.commands import fetch as fetch_command
 from polarlevel.cli import main
+from polarlevel.errors import ApiError
 from polarlevel.exit_codes import ExitCode
 
 
@@ -67,6 +69,7 @@ def test_fetch_dry_run_writes_json(tmp_path: Path) -> None:
 @pytest.fixture
 def oauth_keys() -> tuple[str, ...]:
     return (
+        "POLAR_USER_ID",
         "POLAR_CLIENT_ID",
         "POLAR_CLIENT_SECRET",
         "POLAR_REDIRECT_URI",
@@ -77,6 +80,7 @@ def oauth_keys() -> tuple[str, ...]:
 
 def test_fetch_without_auth_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, oauth_keys: tuple[str, ...]) -> None:
     output_path = tmp_path / "output.csv"
+    monkeypatch.setenv("POLAR_TOKEN_STORE_PATH", str(tmp_path / "missing-tokens.json"))
     for key in oauth_keys:
         monkeypatch.delenv(key, raising=False)
 
@@ -95,7 +99,14 @@ def test_fetch_with_auth_non_dry_run_returns_api_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    def failing_fetch_records(*args: object, **kwargs: object) -> list[object]:
+        _ = args, kwargs
+        raise ApiError("simulated API failure")
+
+    monkeypatch.setattr(fetch_command, "fetch_records", failing_fetch_records)
+
     oauth_env = {
+        "POLAR_USER_ID": "123",
         "POLAR_CLIENT_ID": "id",
         "POLAR_CLIENT_SECRET": "secret",
         "POLAR_REDIRECT_URI": "http://localhost:8000/callback",

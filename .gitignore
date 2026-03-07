@@ -208,3 +208,6 @@ __marimo__/
 
 # Emacs
 *~
+
+# Project output
+output.csv

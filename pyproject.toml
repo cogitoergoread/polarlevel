@@ -5,7 +5,9 @@ description = "Polar access utility"
 authors = [
     {name = "Jozsef Varga Liom", email = "31209755+cogitoergoread@users.noreply.github.com"},
 ]
-dependencies = []
+dependencies = [
+    "requests>=2.32",
+]
 requires-python = ">=3.14"
 readme = "README.md"
 license = {text = "MIT"}
