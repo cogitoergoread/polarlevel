@@ -1,6 +1,6 @@
 """Data retrieval layer for Polar API integration."""
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
 import time
 from typing import Any
@@ -13,9 +13,15 @@ except ModuleNotFoundError:  # pragma: no cover - depends on local environment
 from .config import OAuthConfig
 from .errors import ApiError, AuthenticationError
 from .models import FetchRequest, TelemetryRecord
-from .oauth import TokenState, load_token_state, refresh_access_token
+from .oauth import (
+    TokenState,
+    is_token_expiring_soon,
+    load_token_state,
+    refresh_access_token,
+)
 
 TRANSIENT_STATUS_CODES = {429, 500, 502, 503, 504}
+PROACTIVE_REFRESH_SAFETY_WINDOW_SECONDS = 60
 
 
 def _dry_run_sample() -> list[TelemetryRecord]:
@@ -65,6 +71,8 @@ def fetch_records(
     headers = {"Accept": "application/json"}
     base_url = oauth_config.accesslink_base_url.rstrip("/")
 
+    _refresh_token_if_expiring(http, oauth_config, token_context)
+
     transaction_id = _create_exercise_transaction(
         http,
         oauth_config,
@@ -104,6 +112,24 @@ def fetch_records(
     )
 
     return _apply_request_scope(all_records, request)
+
+
+def _refresh_token_if_expiring(
+    session: Any,
+    oauth_config: OAuthConfig,
+    token_context: dict[str, TokenState],
+) -> None:
+    if not is_token_expiring_soon(
+        token_context["state"],
+        safety_window_seconds=PROACTIVE_REFRESH_SAFETY_WINDOW_SECONDS,
+    ):
+        return
+
+    token_context["state"] = refresh_access_token(
+        session=session,
+        oauth_config=oauth_config,
+        refresh_token=token_context["state"].refresh_token,
+    )
 
 
 def _create_exercise_transaction(
@@ -324,7 +350,7 @@ def _normalize_exercise_payload(
     session_id_raw = _first_non_empty(exercise, "id", "exercise-id", "exerciseId")
     session_id = str(session_id_raw) if session_id_raw is not None else "unknown-session"
 
-    samples_node = exercise.get("samples")
+    samples_node = _resolve_samples_node(exercise)
     heart_rate_samples = _extract_heart_rate_samples(samples_node)
     route_samples = _extract_route_samples(samples_node)
 
@@ -341,11 +367,23 @@ def _normalize_exercise_payload(
             exercise,
             "start-time",
             "startTime",
+            "start_time",
+            "startTimeUtc",
             "date-time",
             "timestamp",
         )
     )
-    fallback_hr = _to_int(_first_non_empty(exercise, "average-heart-rate", "averageHeartRate"))
+    fallback_hr = _to_int(
+        _first_non_empty(
+            exercise,
+            "average-heart-rate",
+            "averageHeartRate",
+            "avg-heart-rate",
+            "avgHeartRate",
+            "heart-rate-average",
+            "heartRateAverage",
+        )
+    )
 
     return [
         TelemetryRecord(
@@ -369,15 +407,43 @@ def _records_from_heart_rate_samples(
     route_by_time: dict[str, Mapping[str, Any]] = {}
     for route_sample in route_samples:
         route_time = _normalize_timestamp(
-            _first_non_empty(route_sample, "date-time", "timestamp", "time")
+            _first_non_empty(
+                route_sample,
+                "date-time",
+                "dateTime",
+                "timestamp",
+                "time",
+                "timeStamp",
+                "utc",
+            )
         )
         route_by_time[route_time] = route_sample
 
     records: list[TelemetryRecord] = []
     for index, hr_sample in enumerate(heart_rate_samples):
-        bpm = _to_int(_first_non_empty(hr_sample, "value", "heart-rate", "heartRate"))
+        bpm = _to_int(
+            _first_non_empty(
+                hr_sample,
+                "value",
+                "heart-rate",
+                "heartRate",
+                "heart_rate",
+                "hr",
+                "bpm",
+                "beats-per-minute",
+                "beatsPerMinute",
+            )
+        )
         timestamp = _normalize_timestamp(
-            _first_non_empty(hr_sample, "date-time", "timestamp", "time")
+            _first_non_empty(
+                hr_sample,
+                "date-time",
+                "dateTime",
+                "timestamp",
+                "time",
+                "timeStamp",
+                "utc",
+            )
         )
         if bpm is None:
             continue
@@ -403,32 +469,241 @@ def _records_from_heart_rate_samples(
     return records
 
 
-def _extract_heart_rate_samples(samples_node: Any) -> list[Mapping[str, Any]]:
-    if not isinstance(samples_node, dict):
-        return []
+def _resolve_samples_node(exercise: Mapping[str, Any]) -> Any:
+    for key in (
+        "samples",
+        "sample",
+        "sample-data",
+        "sampleData",
+        "data",
+        "detailed-samples",
+        "detailedSamples",
+    ):
+        if key in exercise and exercise[key] not in (None, ""):
+            return exercise[key]
 
-    raw_values = (
-        samples_node.get("heart-rate")
-        or samples_node.get("heartRate")
-        or samples_node.get("heart_rate")
+    # Some payloads expose sample groups directly on the exercise object.
+    return exercise
+
+
+def _extract_heart_rate_samples(samples_node: Any) -> list[Mapping[str, Any]]:
+    return _extract_sample_series(
+        samples_node=samples_node,
+        series_keys=(
+            "heart-rate",
+            "heartRate",
+            "heart_rate",
+            "heartRateSamples",
+            "heart-rate-samples",
+            "hr",
+        ),
+        channel_aliases=("heart-rate", "heartRate", "heart_rate", "hr", "heartrate"),
+        row_predicate=_looks_like_heart_rate_sample,
     )
-    if isinstance(raw_values, list):
-        return [item for item in raw_values if isinstance(item, dict)]
-    return []
 
 
 def _extract_route_samples(samples_node: Any) -> list[Mapping[str, Any]]:
-    if not isinstance(samples_node, dict):
+    return _extract_sample_series(
+        samples_node=samples_node,
+        series_keys=(
+            "recorded-route",
+            "recordedRoute",
+            "route",
+            "gps",
+            "location",
+            "position",
+        ),
+        channel_aliases=(
+            "recorded-route",
+            "recordedRoute",
+            "route",
+            "gps",
+            "location",
+            "position",
+        ),
+        row_predicate=_looks_like_route_sample,
+    )
+
+
+def _extract_sample_series(
+    samples_node: Any,
+    series_keys: tuple[str, ...],
+    channel_aliases: tuple[str, ...],
+    row_predicate: Callable[[Mapping[str, Any]], bool],
+) -> list[Mapping[str, Any]]:
+    series_key_aliases = {_normalize_label(key) for key in series_keys}
+    normalized_channel_aliases = {_normalize_label(alias) for alias in channel_aliases}
+    container_aliases = {
+        "samples",
+        "sample",
+        "values",
+        "data",
+        "records",
+        "items",
+        "entries",
+        "points",
+        "channels",
+        "measurements",
+    }
+
+    return _extract_sample_series_recursive(
+        node=samples_node,
+        series_key_aliases=series_key_aliases,
+        channel_aliases=normalized_channel_aliases,
+        container_aliases=container_aliases,
+        row_predicate=row_predicate,
+        depth=0,
+    )
+
+
+def _extract_sample_series_recursive(
+    node: Any,
+    series_key_aliases: set[str],
+    channel_aliases: set[str],
+    container_aliases: set[str],
+    row_predicate: Callable[[Mapping[str, Any]], bool],
+    depth: int,
+) -> list[Mapping[str, Any]]:
+    if depth > 6:
         return []
 
-    raw_values = (
-        samples_node.get("recorded-route")
-        or samples_node.get("recordedRoute")
-        or samples_node.get("route")
-    )
-    if isinstance(raw_values, list):
-        return [item for item in raw_values if isinstance(item, dict)]
+    if isinstance(node, list):
+        dict_items = [item for item in node if isinstance(item, Mapping)]
+        rows = [item for item in dict_items if row_predicate(item)]
+        if rows:
+            return rows
+
+        typed_rows: list[Mapping[str, Any]] = []
+        for item in dict_items:
+            sample_type = _first_non_empty(
+                item,
+                "type",
+                "sample-type",
+                "sampleType",
+                "name",
+                "metric",
+                "channel",
+            )
+            if _normalize_label(sample_type) not in channel_aliases:
+                continue
+
+            nested = _extract_sample_series_recursive(
+                node=item,
+                series_key_aliases=series_key_aliases,
+                channel_aliases=channel_aliases,
+                container_aliases=container_aliases,
+                row_predicate=row_predicate,
+                depth=depth + 1,
+            )
+            if nested:
+                typed_rows.extend(nested)
+
+        if typed_rows:
+            return typed_rows
+
+        for item in dict_items:
+            nested = _extract_sample_series_recursive(
+                node=item,
+                series_key_aliases=series_key_aliases,
+                channel_aliases=channel_aliases,
+                container_aliases=container_aliases,
+                row_predicate=row_predicate,
+                depth=depth + 1,
+            )
+            if nested:
+                return nested
+
+        return []
+
+    if not isinstance(node, Mapping):
+        return []
+
+    if row_predicate(node):
+        return [node]
+
+    for key, value in node.items():
+        key_alias = _normalize_label(key)
+        if (
+            key_alias in series_key_aliases
+            or key_alias in channel_aliases
+            or key_alias in container_aliases
+        ):
+            nested = _extract_sample_series_recursive(
+                node=value,
+                series_key_aliases=series_key_aliases,
+                channel_aliases=channel_aliases,
+                container_aliases=container_aliases,
+                row_predicate=row_predicate,
+                depth=depth + 1,
+            )
+            if nested:
+                return nested
+
     return []
+
+
+def _looks_like_heart_rate_sample(sample: Mapping[str, Any]) -> bool:
+    candidate_value = _first_non_empty(
+        sample,
+        "value",
+        "heartRate",
+        "heart_rate",
+        "hr",
+        "bpm",
+        "beats-per-minute",
+        "beatsPerMinute",
+        "heart-rate",
+    )
+    return _to_int(candidate_value) is not None
+
+
+def _looks_like_route_sample(sample: Mapping[str, Any]) -> bool:
+    direct_coordinate = _first_non_empty(
+        sample,
+        "latitude",
+        "lat",
+        "latitudeDeg",
+        "latitude_deg",
+        "longitude",
+        "lon",
+        "lng",
+        "longitudeDeg",
+        "longitude_deg",
+        "altitude",
+        "elevation",
+        "alt",
+        "ele",
+        "elevation_m",
+        "elevationMeters",
+        "coordinates",
+    )
+    if direct_coordinate is not None:
+        return True
+
+    nested_position = _first_non_empty(sample, "position", "location", "coordinate")
+    if isinstance(nested_position, Mapping):
+        nested_coordinate = _first_non_empty(
+            nested_position,
+            "latitude",
+            "lat",
+            "latitudeDeg",
+            "latitude_deg",
+            "longitude",
+            "lon",
+            "lng",
+            "longitudeDeg",
+            "longitude_deg",
+            "altitude",
+            "elevation",
+            "alt",
+            "ele",
+            "elevation_m",
+            "elevationMeters",
+            "coordinates",
+        )
+        return nested_coordinate is not None
+
+    return False
 
 
 def _extract_route_coordinates(
@@ -437,10 +712,47 @@ def _extract_route_coordinates(
     if route_sample is None:
         return None, None, None
 
-    latitude = _to_float(_first_non_empty(route_sample, "latitude", "lat"))
-    longitude = _to_float(_first_non_empty(route_sample, "longitude", "lon", "lng"))
-    elevation = _to_float(_first_non_empty(route_sample, "altitude", "elevation", "alt"))
+    latitude = _to_float(
+        _first_non_empty(route_sample, "latitude", "lat", "latitudeDeg", "latitude_deg")
+    )
+    longitude = _to_float(
+        _first_non_empty(route_sample, "longitude", "lon", "lng", "longitudeDeg", "longitude_deg")
+    )
+    elevation = _to_float(
+        _first_non_empty(
+            route_sample,
+            "altitude",
+            "elevation",
+            "alt",
+            "ele",
+            "elevation_m",
+            "elevationMeters",
+        )
+    )
+
+    position = _first_non_empty(route_sample, "position", "location", "coordinate")
+    if isinstance(position, Mapping):
+        if latitude is None:
+            latitude = _to_float(_first_non_empty(position, "latitude", "lat"))
+        if longitude is None:
+            longitude = _to_float(_first_non_empty(position, "longitude", "lon", "lng"))
+        if elevation is None:
+            elevation = _to_float(_first_non_empty(position, "altitude", "elevation", "alt", "ele"))
+
+    coordinates = _first_non_empty(route_sample, "coordinates")
+    if isinstance(coordinates, (list, tuple)):
+        if longitude is None and len(coordinates) >= 1:
+            longitude = _to_float(coordinates[0])
+        if latitude is None and len(coordinates) >= 2:
+            latitude = _to_float(coordinates[1])
+        if elevation is None and len(coordinates) >= 3:
+            elevation = _to_float(coordinates[2])
+
     return latitude, longitude, elevation
+
+
+def _normalize_label(value: Any) -> str:
+    return "".join(ch for ch in str(value).lower() if ch.isalnum())
 
 
 def _apply_request_scope(

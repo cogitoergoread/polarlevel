@@ -20,6 +20,7 @@ def _clear_optional_env(monkeypatch: pytest.MonkeyPatch) -> None:
     for key in (
         "POLAR_ACCESS_TOKEN",
         "POLAR_REFRESH_TOKEN",
+        "POLAR_ACCESS_TOKEN_EXPIRES_AT_UTC",
         "POLAR_ACCESSLINK_BASE_URL",
         "POLAR_OAUTH_TOKEN_URL",
         "POLAR_TOKEN_STORE_PATH",
@@ -81,3 +82,21 @@ def test_load_oauth_config_uses_env_tokens_when_store_missing(
     assert config.access_token == "env-access"
     assert config.refresh_token == "env-refresh"
     assert config.token_store_path == missing_store
+
+
+def test_load_oauth_config_reads_optional_access_token_expiry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_required_base_env(monkeypatch)
+    _clear_optional_env(monkeypatch)
+
+    missing_store = tmp_path / "missing-tokens.json"
+    monkeypatch.setenv("POLAR_TOKEN_STORE_PATH", str(missing_store))
+    monkeypatch.setenv("POLAR_ACCESS_TOKEN", "env-access")
+    monkeypatch.setenv("POLAR_REFRESH_TOKEN", "env-refresh")
+    monkeypatch.setenv("POLAR_ACCESS_TOKEN_EXPIRES_AT_UTC", "2026-03-09T12:00:00Z")
+
+    config = load_oauth_config_from_env()
+
+    assert config.access_token_expires_at_utc == "2026-03-09T12:00:00Z"

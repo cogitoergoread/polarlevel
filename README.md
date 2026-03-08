@@ -77,13 +77,15 @@ Token input options:
 export POLAR_ACCESS_TOKEN="..."
 export POLAR_REFRESH_TOKEN="..."
 
-# Option B: token store file containing {"access_token": "...", "refresh_token": "..."}
+# Option B: token store file containing
+# {"access_token": "...", "refresh_token": "...", "access_token_expires_at_utc": "2026-03-09T12:00:00Z"}
 export POLAR_TOKEN_STORE_PATH=".secrets/polar_tokens.json"
 ```
 
 Optional environment variables:
 
 ```bash
+export POLAR_ACCESS_TOKEN_EXPIRES_AT_UTC="2026-03-09T12:00:00Z"
 export POLAR_ACCESSLINK_BASE_URL="https://www.polaraccesslink.com"
 export POLAR_OAUTH_TOKEN_URL="https://polarremote.com/v2/oauth2/token"
 export POLAR_ACCESSLINK_TIMEOUT_SECONDS="30"
@@ -93,6 +95,8 @@ export POLAR_ACCESSLINK_RETRY_COUNT="3"
 Current behavior:
 - Non-dry-run mode validates required OAuth settings and token source availability.
 - Access token and refresh token are loaded from token store when present, otherwise from environment.
+- Access token expiry metadata is loaded from token store or `POLAR_ACCESS_TOKEN_EXPIRES_AT_UTC` when available.
+- If expiry metadata shows the access token is near expiry, the CLI refreshes proactively before the first AccessLink request.
 - Non-dry-run mode performs live API calls using the exercise transaction flow.
 - On HTTP `401`, the CLI refreshes the access token via refresh-token grant and retries the request.
 - Refreshed tokens are persisted to `POLAR_TOKEN_STORE_PATH`.

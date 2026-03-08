@@ -207,3 +207,155 @@ def test_fetch_records_refreshes_token_on_unauthorized(
     persisted = json.loads(oauth_config.token_store_path.read_text(encoding="utf-8"))
     assert persisted["access_token"] == "new-access"
     assert persisted["refresh_token"] == "new-refresh"
+
+
+def test_fetch_records_refreshes_expiring_token_before_first_api_call(
+    oauth_config: OAuthConfig,
+    latest_request: FetchRequest,
+) -> None:
+    oauth_config.token_store_path.write_text(
+        json.dumps(
+            {
+                "access_token": "stale-access",
+                "refresh_token": "stale-refresh",
+                "access_token_expires_at_utc": "2020-01-01T00:00:00Z",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    session = FakeSession(
+        responses=[
+            FakeResponse(
+                200,
+                {
+                    "access_token": "fresh-access",
+                    "refresh_token": "fresh-refresh",
+                    "expires_in": 3600,
+                },
+            ),
+            FakeResponse(201, {"transaction-id": "tx-preflight"}),
+            FakeResponse(200, []),
+            FakeResponse(204, None),
+        ]
+    )
+
+    records = fetch_records(latest_request, oauth_config, session=session)
+
+    assert records == []
+    assert session.calls[0]["url"] == oauth_config.token_endpoint_url
+    assert session.calls[0]["data"]["grant_type"] == "refresh_token"
+    assert session.calls[0]["data"]["refresh_token"] == "stale-refresh"
+    assert session.calls[1]["headers"]["Authorization"] == "Bearer fresh-access"
+
+    persisted = json.loads(oauth_config.token_store_path.read_text(encoding="utf-8"))
+    assert persisted["access_token"] == "fresh-access"
+    assert persisted["refresh_token"] == "fresh-refresh"
+    assert "access_token_expires_at_utc" in persisted
+
+
+def test_fetch_records_extracts_samples_from_typed_channels(
+    oauth_config: OAuthConfig,
+    latest_request: FetchRequest,
+) -> None:
+    session = FakeSession(
+        responses=[
+            FakeResponse(201, {"transaction-id": "tx-typed"}),
+            FakeResponse(200, [{"id": "exercise-typed"}]),
+            FakeResponse(
+                200,
+                {
+                    "id": "exercise-typed",
+                    "samples": {
+                        "sample": [
+                            {
+                                "type": "HEART_RATE",
+                                "values": [
+                                    {"timeStamp": "2026-03-07T10:00:00Z", "bpm": "111"},
+                                    {
+                                        "timeStamp": "2026-03-07T10:00:05Z",
+                                        "beatsPerMinute": 112,
+                                    },
+                                ],
+                            },
+                            {
+                                "type": "recordedRoute",
+                                "data": [
+                                    {
+                                        "timeStamp": "2026-03-07T10:00:00Z",
+                                        "position": {"lat": 47.2, "lon": 19.2, "alt": 150},
+                                    },
+                                    {
+                                        "timeStamp": "2026-03-07T10:00:05Z",
+                                        "coordinates": [19.3, 47.3, 151],
+                                    },
+                                ],
+                            },
+                        ]
+                    },
+                },
+            ),
+            FakeResponse(204, None),
+        ]
+    )
+
+    records = fetch_records(latest_request, oauth_config, session=session)
+
+    assert len(records) == 2
+    assert records[0].heart_rate_bpm == 111
+    assert records[0].latitude == pytest.approx(47.2)
+    assert records[0].longitude == pytest.approx(19.2)
+    assert records[0].elevation_m == pytest.approx(150.0)
+
+    assert records[1].heart_rate_bpm == 112
+    assert records[1].latitude == pytest.approx(47.3)
+    assert records[1].longitude == pytest.approx(19.3)
+    assert records[1].elevation_m == pytest.approx(151.0)
+
+
+def test_fetch_records_extracts_sample_data_variants(
+    oauth_config: OAuthConfig,
+    latest_request: FetchRequest,
+) -> None:
+    session = FakeSession(
+        responses=[
+            FakeResponse(201, {"transaction-id": "tx-sample-data"}),
+            FakeResponse(200, [{"id": "exercise-sample-data"}]),
+            FakeResponse(
+                200,
+                {
+                    "id": "exercise-sample-data",
+                    "sampleData": {
+                        "heartRateSamples": {
+                            "items": [
+                                {
+                                    "utc": "2026-03-07T11:00:00Z",
+                                    "beats-per-minute": "121",
+                                }
+                            ]
+                        },
+                        "gps": {
+                            "points": [
+                                {
+                                    "utc": "2026-03-07T11:00:00Z",
+                                    "latitudeDeg": "47.4",
+                                    "longitudeDeg": "19.4",
+                                    "elevation_m": "88.5",
+                                }
+                            ]
+                        },
+                    },
+                },
+            ),
+            FakeResponse(200, {}),
+        ]
+    )
+
+    records = fetch_records(latest_request, oauth_config, session=session)
+
+    assert len(records) == 1
+    assert records[0].timestamp_utc == "2026-03-07T11:00:00Z"
+    assert records[0].heart_rate_bpm == 121
+    assert records[0].latitude == pytest.approx(47.4)
+    assert records[0].longitude == pytest.approx(19.4)
+    assert records[0].elevation_m == pytest.approx(88.5)

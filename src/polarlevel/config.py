@@ -36,6 +36,7 @@ class OAuthConfig:
     token_store_path: Path
     http_timeout_seconds: int
     retry_count: int
+    access_token_expires_at_utc: str | None = None
 
 
 def load_oauth_config_from_env() -> OAuthConfig:
@@ -87,6 +88,7 @@ def load_oauth_config_from_env() -> OAuthConfig:
 
     access_token = os.getenv("POLAR_ACCESS_TOKEN")
     refresh_token = os.getenv("POLAR_REFRESH_TOKEN")
+    access_token_expires_at_utc = os.getenv("POLAR_ACCESS_TOKEN_EXPIRES_AT_UTC")
 
     if (not access_token or not refresh_token) and not token_store_path.exists():
         raise AuthenticationError(
@@ -106,4 +108,5 @@ def load_oauth_config_from_env() -> OAuthConfig:
         token_store_path=token_store_path,
         http_timeout_seconds=timeout_seconds,
         retry_count=retry_count,
+        access_token_expires_at_utc=access_token_expires_at_utc,
     )
